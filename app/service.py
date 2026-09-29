@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import sqlite3
 
+from .bgpaudit import BgpAuditError, audit
 from .cidrmath import compute_free, delegation_fragments, lowest_aligned, parse_network
 from .cidrpolicy import PolicyError, compile_policy
 from .db import read_transaction, write_transaction
@@ -319,6 +320,20 @@ def compile_cidr_policy(scope: str, default_action: str, rules: list) -> dict:
             {"cidr": str(network), "action": action} for network, action in segments
         ],
     }
+
+
+def audit_bgp_announcements(relationships: list, announcements: list) -> dict:
+    """Audit AS paths and compare valid announcements.
+
+    Pure, stateless computation: no pool, exclusion or allocation data is
+    read or written.  ``relationships`` and ``announcements`` are pydantic
+    objects exposing the request fields.
+    """
+
+    try:
+        return audit(relationships, announcements)
+    except BgpAuditError as exc:
+        raise ApiError(422, exc.detail, code=exc.code)
 
 
 def _plan_error(detail: str, code: str) -> ApiError:

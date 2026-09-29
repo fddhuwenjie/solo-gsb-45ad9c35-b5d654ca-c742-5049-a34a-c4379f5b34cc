@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal, Union
 
 from pydantic import BaseModel, Field
+
+from .bgpaudit import MAX_ASN
 
 # Snapshot format version.  Only version 1 is understood by this service.
 SNAPSHOT_VERSION = 1
@@ -249,4 +251,103 @@ class RestoreResponse(BaseModel):
     replaced: bool = Field(
         ...,
         description="True when pool state was replaced; false on an idempotent replay",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stateless BGP announcement auditing
+# ---------------------------------------------------------------------------
+
+# 32-bit AS number.  AS 0 (reserved) and AS 4294967295 (AS_TRANS/reserved) are
+# outside this range and rejected at request validation.
+Asn = Annotated[int, Field(ge=1, le=MAX_ASN - 1)]
+
+
+class CustomerProviderRelation(BaseModel):
+    """Transit relationship: ``customer`` buys connectivity from ``provider``."""
+
+    type: Literal["customer_provider"]
+    customer: Asn
+    provider: Asn
+
+
+class PeerRelation(BaseModel):
+    a: Asn
+    b: Asn
+    type: Literal["peer"] = "peer"
+
+
+AsRelation = Annotated[
+    Union[CustomerProviderRelation, PeerRelation],
+    Field(discriminator="type"),
+]
+
+
+class BgpAnnouncement(BaseModel):
+    id: str = Field(..., min_length=1, description="Unique id within this request")
+    prefix: str = Field(
+        ...,
+        min_length=1,
+        description="Strict IPv4 CIDR, e.g. 203.0.113.0/24",
+    )
+    as_path: list[Asn] = Field(
+        ...,
+        min_length=1,
+        description="ASNs from the vantage point toward the origin",
+    )
+
+
+class BgpAuditRequest(BaseModel):
+    relationships: list[AsRelation] = Field(
+        default_factory=list,
+        description=(
+            "AS relationships used to validate every adjacent AS_PATH pair"
+        ),
+    )
+    announcements: list[BgpAnnouncement] = Field(
+        ...,
+        min_length=1,
+        description="Batch of announcements to audit; ids must be unique",
+    )
+
+
+class ViolatingHop(BaseModel):
+    hop: int = Field(
+        ...,
+        description=(
+            "Zero-based index of the first violating hop in the folded path, "
+            "i.e. the edge as_path[hop] -> as_path[hop + 1]"
+        ),
+    )
+    from_asn: Asn
+    to_asn: Asn
+
+
+class BgpAuditResult(BaseModel):
+    id: str
+    prefix: str
+    as_path: list[Asn] = Field(
+        ...,
+        description="The folded path (consecutive duplicate ASNs collapsed)"
+    )
+    origin: Asn = Field(..., description="Last ASN of the folded path")
+    status: Literal["valid", "as_loop", "invalid_path"]
+    flags: list[Literal["moas", "origin_change"]] = Field(
+        ...,
+        description="Comparison flags; only announcements with status 'valid' "
+        "are compared, so other statuses always carry an empty list",
+    )
+    violating_hop: ViolatingHop | None = Field(
+        default=None,
+        description="First hop breaking the customer-provider/peer shape; "
+        "set only when status is 'invalid_path'",
+    )
+
+
+class BgpAuditResponse(BaseModel):
+    results: list[BgpAuditResult] = Field(
+        ...,
+        description=(
+            "Sorted by network address, then prefix length, then announcement id"
+        ),
     )
