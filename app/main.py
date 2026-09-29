@@ -17,6 +17,8 @@ from .schemas import (
     AllocateRequest,
     AllocationResponse,
     AllocationItem,
+    BgpAuditRequest,
+    BgpAuditResponse,
     CidrPolicyCompileRequest,
     CidrPolicyCompileResponse,
     ExclusionCreateRequest,
@@ -41,10 +43,11 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="IPv4 Subnet Allocation API",
-    version="1.2.0",
+    version="1.3.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
-        "and build RFC 2317 reverse-DNS delegation plans for current allocations."
+        "build RFC 2317 reverse-DNS delegation plans for current allocations, "
+        "and statelessly audit BGP announcements against AS relationships."
     ),
     lifespan=lifespan,
 )
@@ -71,6 +74,16 @@ def health() -> dict:
 def compile_cidr_policy(body: CidrPolicyCompileRequest) -> CidrPolicyCompileResponse:
     result = service.compile_cidr_policy(body.scope, body.default_action, body.rules)
     return CidrPolicyCompileResponse(**result)
+
+
+@app.post(
+    "/bgp/announcements/audit",
+    response_model=BgpAuditResponse,
+    tags=["bgp"],
+)
+def audit_bgp_announcements(body: BgpAuditRequest) -> BgpAuditResponse:
+    result = service.audit_bgp_announcements(body.relationships, body.announcements)
+    return BgpAuditResponse(**result)
 
 
 @app.post("/pools", response_model=PoolResponse, status_code=201, tags=["pools"])

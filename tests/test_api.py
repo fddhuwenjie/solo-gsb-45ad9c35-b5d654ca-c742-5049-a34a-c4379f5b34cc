@@ -859,3 +859,231 @@ def test_cidr_policy_compile_bad_action_rejected(client):
         },
     )
     assert resp.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /bgp/announcements/audit
+# ---------------------------------------------------------------------------
+
+
+def _audit_bgp(client, payload):
+    return client.post("/bgp/announcements/audit", json=payload)
+
+
+def _bgp_body(announcements, relationships=None):
+    rels = relationships
+    if rels is None:
+        rels = [
+            {"type": "c2p", "customer": 65001, "provider": 100},
+            {"type": "c2p", "customer": 65002, "provider": 100},
+            {"type": "c2p", "customer": 100, "provider": 10},
+            {"type": "peer", "asn_a": 10, "asn_b": 20},
+            {"type": "c2p", "customer": 65003, "provider": 20},
+            {"type": "c2p", "customer": 65004, "provider": 65003},
+        ]
+    return {"relationships": rels, "announcements": announcements}
+
+
+def test_bgp_audit_full_example(client):
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [
+                {"id": "a1", "prefix": "203.0.113.0/24",
+                 "as_path": [65001, 65001, 100, 10, 20, 65003]},
+                {"id": "a2", "prefix": "203.0.113.0/24",
+                 "as_path": [65002, 100, 10, 20, 65003, 65004]},
+                {"id": "a3", "prefix": "203.0.113.128/25",
+                 "as_path": [65002, 100, 10, 20, 65003, 65004]},
+                {"id": "a4", "prefix": "198.51.100.0/24",
+                 "as_path": [65003, 20, 65003]},
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    by_id = {r["id"]: r for r in body["results"]}
+
+    # Prepending folded; a1 is a valid path originated by 65003.
+    assert by_id["a1"]["as_path"] == [65001, 100, 10, 20, 65003]
+    assert by_id["a1"]["status"] == "valid"
+    assert by_id["a1"]["violating_hop"] is None
+
+    # Same /24 from two origins -> MOAS on both.
+    assert by_id["a1"]["flags"] == ["moas"]
+    assert by_id["a2"]["flags"] == ["moas"]
+    assert by_id["a2"]["origin"] == 65004
+
+    # The /25 inherits the nearest cover's origin set {65003, 65004}, so no
+    # origin change; the /32-style looped announcement is excluded.
+    assert by_id["a3"]["flags"] == []
+    assert by_id["a4"]["status"] == "as_loop"
+    assert by_id["a4"]["flags"] == []
+
+    assert body["summary"] == {
+        "total": 4,
+        "valid": 3,
+        "as_loop": 1,
+        "invalid_path": 0,
+        "moas": 2,
+        "origin_change": 0,
+    }
+
+
+def test_bgp_audit_origin_change_uses_nearest_cover(client):
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [
+                {"id": "cover", "prefix": "203.0.113.0/24",
+                 "as_path": [65001, 100, 10, 20, 65003]},
+                {"id": "spec", "prefix": "203.0.113.128/25",
+                 "as_path": [65002, 100, 10, 20, 65003, 65004]},
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    by_id = {r["id"]: r for r in resp.json()["results"]}
+    assert by_id["cover"]["flags"] == []
+    assert by_id["spec"]["flags"] == ["origin_change"]
+    assert resp.json()["summary"]["origin_change"] == 1
+
+
+def test_bgp_audit_first_violating_hop(client):
+    rels = [
+        {"type": "c2p", "customer": 9001, "provider": 9002},
+        {"type": "c2p", "customer": 9003, "provider": 9002},
+        {"type": "c2p", "customer": 9003, "provider": 9004},
+    ]
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [{"id": "x", "prefix": "192.0.2.0/24",
+              "as_path": [9001, 9002, 9003, 9004]}],
+            relationships=rels,
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    assert result["status"] == "invalid_path"
+    assert result["violating_hop"] == {
+        "index": 2,
+        "source": 9003,
+        "target": 9004,
+        "relationship": "customer_to_provider",
+        "reason": "customer_to_provider_after_provider_to_customer",
+    }
+
+
+def test_bgp_audit_sorted_stably(client):
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [
+                {"id": "zeta", "prefix": "203.0.113.0/25", "as_path": [65003]},
+                {"id": "alpha", "prefix": "203.0.113.0/24", "as_path": [65003]},
+                {"id": "beta", "prefix": "10.0.0.0/8", "as_path": [65003]},
+                {"id": "gamma", "prefix": "203.0.113.0/25", "as_path": [65003]},
+            ]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+    assert [(r["prefix"], r["id"]) for r in resp.json()["results"]] == [
+        ("10.0.0.0/8", "beta"),
+        ("203.0.113.0/24", "alpha"),
+        ("203.0.113.0/25", "gamma"),
+        ("203.0.113.0/25", "zeta"),
+    ]
+
+
+def test_bgp_audit_unknown_relationship_422(client):
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [{"id": "x", "prefix": "203.0.113.0/24",
+              "as_path": [65001, 100, 777]}]
+        ),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "bgp_unknown_relationship"
+
+
+def test_bgp_audit_conflicting_relationship_422(client):
+    rels = [
+        {"type": "c2p", "customer": 1, "provider": 2},
+        {"type": "c2p", "customer": 2, "provider": 1},
+    ]
+    resp = _audit_bgp(client, _bgp_body([], relationships=rels))
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "bgp_relationship_conflict"
+
+
+def test_bgp_audit_duplicate_id_422(client):
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [
+                {"id": "x", "prefix": "203.0.113.0/24", "as_path": [65003]},
+                {"id": "x", "prefix": "203.0.113.1.0/24", "as_path": [65003]},
+            ]
+        ),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "bgp_duplicate_announcement_id"
+
+
+def test_bgp_audit_invalid_prefix_422(client):
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [{"id": "x", "prefix": "203.0.113.5/24", "as_path": [65003]}]
+        ),
+    )
+    assert resp.status_code == 422
+    assert resp.json()["error"]["code"] == "invalid_cidr"
+
+
+def test_bgp_audit_bad_asn_rejected_by_schema(client):
+    # AS 0 is not a valid 32-bit AS number; pydantic rejects the request body.
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [{"id": "x", "prefix": "203.0.113.0/24", "as_path": [0]}]
+        ),
+    )
+    assert resp.status_code == 422
+
+
+def test_bgp_audit_empty_batch(client):
+    resp = _audit_bgp(client, {"relationships": [], "announcements": []})
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "results": [],
+        "summary": {
+            "total": 0,
+            "valid": 0,
+            "as_loop": 0,
+            "invalid_path": 0,
+            "moas": 0,
+            "origin_change": 0,
+        },
+    }
+
+
+def test_bgp_audit_is_stateless_and_read_only(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    client.post(f"/pools/{pid}/allocations", json={"request_id": "a", "prefix_length": 27})
+    before_pools = client.get("/pools").json()
+    before_pool = client.get(f"/pools/{pid}").json()
+
+    resp = _audit_bgp(
+        client,
+        _bgp_body(
+            [{"id": "x", "prefix": "203.0.113.0/24",
+              "as_path": [65001, 100, 10, 20, 65003]}]
+        ),
+    )
+    assert resp.status_code == 200, resp.text
+
+    assert client.get("/pools").json() == before_pools
+    assert client.get(f"/pools/{pid}").json() == before_pool

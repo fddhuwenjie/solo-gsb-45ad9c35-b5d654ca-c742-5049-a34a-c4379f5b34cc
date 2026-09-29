@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field
 
@@ -250,3 +250,97 @@ class RestoreResponse(BaseModel):
         ...,
         description="True when pool state was replaced; false on an idempotent replay",
     )
+
+
+# ---------------------------------------------------------------------------
+# Stateless BGP announcement auditing
+# ---------------------------------------------------------------------------
+
+# 32-bit AS numbers; AS 0 and the reserved 32-bit max are excluded.
+BgpAsn = Annotated[int, Field(strict=True, ge=1, le=4294967294)]
+
+
+class C2PRelationshipRequest(BaseModel):
+    """The ``customer`` AS buys transit from the ``provider`` AS."""
+
+    type: Literal["c2p"] = Field(
+        ..., description="Relationship kind: customer -> provider"
+    )
+    customer: BgpAsn
+    provider: BgpAsn
+
+
+class PeerRelationshipRequest(BaseModel):
+    """A peering relationship; AS order is insignificant."""
+
+    type: Literal["peer"] = Field(..., description="Relationship kind: peer")
+    asn_a: BgpAsn
+    asn_b: BgpAsn
+
+
+RelationshipRequest = Annotated[
+    C2PRelationshipRequest | PeerRelationshipRequest,
+    Field(discriminator="type"),
+]
+
+
+class BgpAnnouncementRequest(BaseModel):
+    id: str = Field(
+        ..., min_length=1, description="Client-chosen unique id within the batch"
+    )
+    prefix: str = Field(..., description="Strictly valid IPv4 CIDR, e.g. 203.0.113.0/24")
+    as_path: list[BgpAsn] = Field(
+        ...,
+        min_length=1,
+        description="ASNs ordered observer -> origin (prepending allowed)",
+    )
+
+
+class BgpAuditRequest(BaseModel):
+    relationships: list[RelationshipRequest] = Field(
+        default_factory=list,
+        description="AS relationship declarations: customer->provider or peer links",
+    )
+    announcements: list[BgpAnnouncementRequest] = Field(
+        default_factory=list,
+        description="Batch of announcements to audit; every id must be unique",
+    )
+
+
+class BgpViolatingHop(BaseModel):
+    index: int = Field(
+        ..., description="Zero-based index of the hop within the folded AS path"
+    )
+    source: BgpAsn
+    target: BgpAsn
+    relationship: Literal["customer_to_provider", "provider_to_customer", "peer"]
+    reason: str = Field(..., description="Why this hop breaks the c2p* peer? p2c* order")
+
+
+class BgpAuditResult(BaseModel):
+    id: str
+    prefix: str
+    as_path: list[int] = Field(..., description="The folded path (consecutive repeats collapsed)")
+    origin: BgpAsn = Field(..., description="Last AS of the folded path")
+    status: Literal["valid", "as_loop", "invalid_path"]
+    flags: list[Literal["moas", "origin_change"]]
+    violating_hop: BgpViolatingHop | None = None
+
+
+class BgpAuditSummary(BaseModel):
+    total: int
+    valid: int
+    as_loop: int
+    invalid_path: int
+    moas: int
+    origin_change: int
+
+
+class BgpAuditResponse(BaseModel):
+    results: list[BgpAuditResult] = Field(
+        ...,
+        description=(
+            "Sorted by network address, prefix length, then announcement id"
+        ),
+    )
+    summary: BgpAuditSummary

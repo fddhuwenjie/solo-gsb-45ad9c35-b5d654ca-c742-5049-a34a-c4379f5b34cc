@@ -5,6 +5,7 @@ from __future__ import annotations
 import ipaddress
 import sqlite3
 
+from .bgpaudit import BgpAuditError, audit_announcements
 from .cidrmath import compute_free, delegation_fragments, lowest_aligned, parse_network
 from .cidrpolicy import PolicyError, compile_policy
 from .db import read_transaction, write_transaction
@@ -319,6 +320,30 @@ def compile_cidr_policy(scope: str, default_action: str, rules: list) -> dict:
             {"cidr": str(network), "action": action} for network, action in segments
         ],
     }
+
+
+def audit_bgp_announcements(relationships: list, announcements: list) -> dict:
+    """Validate AS paths and compare origins across announcements.
+
+    Pure, read-only computation: like policy compilation it never opens a
+    database transaction, so pools and allocations are untouched.
+    """
+
+    raw_relationships: list[tuple[str, int, int]] = []
+    for rel in relationships:
+        if rel.type == "c2p":
+            raw_relationships.append(("c2p", rel.customer, rel.provider))
+        else:
+            raw_relationships.append(("peer", rel.asn_a, rel.asn_b))
+
+    raw_announcements = [
+        (ann.id, ann.prefix, list(ann.as_path)) for ann in announcements
+    ]
+
+    try:
+        return audit_announcements(raw_relationships, raw_announcements)
+    except BgpAuditError as exc:
+        raise ApiError(422, exc.detail, code=exc.code)
 
 
 def _plan_error(detail: str, code: str) -> ApiError:

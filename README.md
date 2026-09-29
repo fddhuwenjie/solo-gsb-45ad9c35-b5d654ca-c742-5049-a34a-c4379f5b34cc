@@ -11,6 +11,9 @@
 - 可为当前分配生成 **RFC 2317 反向 DNS 委派计划**（只读，非八位边界 CIDR 自动拆分）
 - 池状态可导出为带 **SHA-256 摘要的规范 JSON 快照**，并在一个 SQLite 写事务内校验、恢复（`restore_id` 幂等重放）
 - 可将按优先级排列的 CIDR 允许/拒绝规则**编译**为覆盖整个 scope 的不重叠分段（只读，不触碰地址池与分配数据）
+- 可对一批 BGP 公告做**无状态 AS 关系路径审计**：折叠 prepend、识别 AS 环、按
+  `customer→provider* peer? provider→customer*` 的无山谷规则定位首个违例 hop，
+  并只在通过审计的公告之间标记 MOAS 与更具体前缀起源变更（只读，不读写数据库）
 - 一条命令启动，监听 **8000** 端口
 
 ## 快速开始
@@ -56,6 +59,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `GET` | `/pools/{id}/snapshot` | 导出带 SHA-256 摘要的规范 JSON 池快照 |
 | `POST` | `/pools/{id}/snapshot/restore` | 校验摘要后在一个写事务内恢复池状态（`restore_id` 幂等） |
 | `POST` | `/cidr-policy/compile` | 将优先级 CIDR 规则编译为覆盖 scope 的不重叠动作分段（只读） |
+| `POST` | `/bgp/announcements/audit` | 按 AS 关系审计 BGP 公告路径并比较起源（无状态、只读） |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建地址池
@@ -389,6 +393,170 @@ deny），故不合并；若二者都是 allow，则合并为单个 `10.0.0.64/2
 `scope` 内返回 `422 rule_outside_scope`；动作取值非法由请求校验直接
 返回 422。
 
+### 11. BGP 公告路径审计（无状态、只读）
+
+`POST /bgp/announcements/audit` 接收一批 AS 关系声明与 BGP 公告，逐条做路径
+审计并在通过审计的公告之间比较前缀起源。该接口是**纯计算**：不读取也不写入
+数据库，不要求先创建池，重复请求结果完全一致。
+
+**关系声明** `relationships[]`（同一对 AS 的重复声明必须一致，否则 422）：
+
+- `{"type": "c2p", "customer": 65001, "provider": 100}`：客户→提供商；
+- `{"type": "peer", "asn_a": 10, "asn_b": 20}`：对等体，`asn_a` / `asn_b`
+  顺序无关；
+- 同一对 AS 不允许既声明 `c2p`（无论方向）又声明 `peer`，也不允许两个方向的
+  `c2p` 冲突；逐条完全相同的重复声明会被接受。
+
+**公告** `announcements[]`：
+
+- `id`：本批次内唯一的字符串标识，重复返回 `422 bgp_duplicate_announcement_id`；
+- `prefix`：严格合法的 **IPv4** CIDR（不允许主机位、不接受 IPv6）；
+- `as_path`：**按观察点到起源**排列的 32 位 ASN 序列，至少一个 AS。
+
+**路径处理规则**：
+
+1. 先只折叠**连续重复**的 ASN（BGP prepending），如
+   `[65001, 65001, 100, 100, 10]` 折叠为 `[65001, 100, 10]`；
+2. 折叠后出现**非连续重复** ASN（同一个 AS 在路径上出现两次）记为 `as_loop`，
+   不再校验相邻关系与路径形状，也不参与前缀比较；
+3. 其余路径上每个相邻 AS 对都必须在 `relationships` 中有声明，否则
+   `422 bgp_unknown_relationship`（整个请求失败，不返回逐条结果）；
+4. 路径必须依次经过**零次或多次** `customer→provider`、**至多一个** `peer`、
+   **零次或多次** `provider→customer`（无山谷模型，该规则与路径反向无关）。
+   首个违反该次序的 hop 记为 `invalid_path`，并在 `violating_hop` 中给出
+   从 0 开始的 hop 下标、两端 ASN、实际遍历方向（`customer_to_provider` /
+   `provider_to_customer` / `peer`）与原因。
+
+**前缀比较只在通过路径审计（`valid`）的公告之间进行**：
+
+- `moas`：完全相同的前缀由两个及以上**不同起源 AS** 公告；同一起源的多份
+  公告不算 MOAS；
+- `origin_change`：某公告前缀是另一条公告前缀的更具体子网，且其起源 AS
+  **不在最近覆盖前缀**（最长前缀匹配，即包含它的最具体前缀）的起源集合中。
+  存在多个等长最近覆盖前缀时任一覆盖起源包含该起源即视为未变更。
+
+`as_loop` / `invalid_path` 的公告既不会触发 MOAS，也不会作为覆盖前缀或
+更具体前缀参与 `origin_change` 比较。
+
+**结果稳定排序**：`results` 按网络地址数值、前缀长度（长前缀在后）、
+公告 `id` 字典序排列；`as_path` 返回折叠后的路径，`origin` 为折叠路径最后
+一个 ASN。`summary` 给出各类计数。
+
+```bash
+curl -X POST http://localhost:8000/bgp/announcements/audit \
+  -H 'Content-Type: application/json' -d '{
+    "relationships": [
+      {"type": "c2p", "customer": 65001, "provider": 100},
+      {"type": "c2p", "customer": 65002, "provider": 100},
+      {"type": "c2p", "customer": 100, "provider": 10},
+      {"type": "peer", "asn_a": 10, "asn_b": 20},
+      {"type": "c2p", "customer": 65003, "provider": 20},
+      {"type": "c2p", "customer": 65004, "provider": 65003}
+    ],
+    "announcements": [
+      {"id": "a1", "prefix": "203.0.113.0/24",
+       "as_path": [65001, 65001, 100, 10, 20, 65003]},
+      {"id": "a2", "prefix": "203.0.113.0/24",
+       "as_path": [65002, 100, 10, 20, 65003, 65004]},
+      {"id": "a3", "prefix": "198.51.100.0/24",
+       "as_path": [65001, 100, 10, 20, 65003]},
+      {"id": "a4", "prefix": "198.51.100.128/25",
+       "as_path": [65002, 100, 10, 20, 65003, 65004]},
+      {"id": "a5", "prefix": "192.0.2.0/24", "as_path": [65003, 20, 65003]}
+    ]
+  }'
+```
+
+```json
+{
+  "results": [
+    {
+      "id": "a5",
+      "prefix": "192.0.2.0/24",
+      "as_path": [65003, 20, 65003],
+      "origin": 65003,
+      "status": "as_loop",
+      "flags": [],
+      "violating_hop": null
+    },
+    {
+      "id": "a3",
+      "prefix": "198.51.100.0/24",
+      "as_path": [65001, 100, 10, 20, 65003],
+      "origin": 65003,
+      "status": "valid",
+      "flags": [],
+      "violating_hop": null
+    },
+    {
+      "id": "a4",
+      "prefix": "198.51.100.128/25",
+      "as_path": [65002, 100, 10, 20, 65003, 65004],
+      "origin": 65004,
+      "status": "valid",
+      "flags": ["origin_change"],
+      "violating_hop": null
+    },
+    {
+      "id": "a1",
+      "prefix": "203.0.113.0/24",
+      "as_path": [65001, 100, 10, 20, 65003],
+      "origin": 65003,
+      "status": "valid",
+      "flags": ["moas"],
+      "violating_hop": null
+    },
+    {
+      "id": "a2",
+      "prefix": "203.0.113.0/24",
+      "as_path": [65002, 100, 10, 20, 65003, 65004],
+      "origin": 65004,
+      "status": "valid",
+      "flags": ["moas"],
+      "violating_hop": null
+    }
+  ],
+  "summary": {
+    "total": 5,
+    "valid": 4,
+    "as_loop": 1,
+    "invalid_path": 0,
+    "moas": 2,
+    "origin_change": 1
+  }
+}
+```
+
+上例中 `a4` 的起源 65004 不同于最近覆盖前缀 `198.51.100.0/24` 的起源
+65003，故标记 `origin_change`；`203.0.113.0/24` 同时由 65003 与 65004
+起源，两条公告均标记 `moas`。
+
+非法路径示例：关系为 `9003` 是 `9002` 的客户、`9004` 是 `9003` 的提供商时，
+路径 `[9001, 9002, 9003, 9004]` 在 hop 0 沿客户→提供商上行、hop 1 变为
+提供商→客户后，hop 2 又转为客户→提供商，形成山谷：
+
+```json
+{
+  "id": "a6",
+  "prefix": "198.18.0.0/24",
+  "as_path": [9001, 9002, 9003, 9004],
+  "origin": 9004,
+  "status": "invalid_path",
+  "flags": [],
+  "violating_hop": {
+    "index": 2,
+    "source": 9003,
+    "target": 9004,
+    "relationship": "customer_to_provider",
+    "reason": "customer_to_provider_after_provider_to_customer"
+  }
+}
+```
+
+`as_path` 为空、ASN 越界（不在 1..4294967294）或关系 `type` 取值非法由请求
+校验直接返回 422；整批为空（`relationships` 与 `announcements` 均为空数组）
+合法，返回空 `results` 与全零 `summary`。
+
 ## 错误响应
 
 统一格式：
@@ -426,8 +594,15 @@ deny），故不合并；若二者都是 allow，则合并为单个 `10.0.0.64/2
 | 422 | `reverse_name_conflict` | 两个子网声明了同一个子区名 |
 | 422 | `nameserver_insufficient` / `invalid_nameserver` | 权威服务器少于两台，或名称非法 |
 | 422 | `invalid_ptr` | PTR 地址非法、越界、重复，或主机名非法 |
-| 422 | `invalid_cidr` | 策略编译的 `scope` 或规则 CIDR 非法（含主机位、非 IPv4 等） |
+| 422 | `invalid_cidr` | 策略编译的 `scope` 或规则 CIDR 非法（含主机位、非 IPv4 等），或 BGP 公告前缀非法 |
 | 422 | `rule_outside_scope` | CIDR 策略规则不在 `scope` 内 |
+| 422 | `bgp_unknown_relationship` | 公告路径中相邻的两个 ASN 之间没有任何关系声明 |
+| 422 | `bgp_relationship_conflict` | 同一 AS 对声明了冲突关系（两个方向的 c2p，或 c2p 与 peer 并存） |
+| 422 | `bgp_self_relationship` | 关系声明的两端是同一个 AS |
+| 422 | `bgp_duplicate_announcement_id` | 同一批公告中出现重复的 `id` |
+
+注：`as_loop` 与 `invalid_path` 是**逐条审计结果**（HTTP 200，见
+`results[].status`），不是错误响应；只有整批输入无法处理时才返回 422。
 
 ## 并发与事务
 
@@ -452,6 +627,7 @@ deny），故不合并；若二者都是 allow，则合并为单个 `10.0.0.64/2
 │   ├── db.py          # SQLite 连接、建表、事务管理
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
 │   ├── cidrpolicy.py  # CIDR 策略编译：首条匹配规则 -> 不重叠动作分段（仅同级同动作合并）
+│   ├── bgpaudit.py    # BGP 公告审计：prepend 折叠、AS 环、无山谷路径规则、MOAS/起源变更（纯函数）
 │   ├── reversedns.py  # RFC 2317 反向区名运算与 NS/CNAME/PTR 记录生成
 │   └── schemas.py     # Pydantic 模型
 ├── tests/             # pytest：算法单测 + API 集成 + 并发测试
